@@ -50,7 +50,7 @@ s3-vpc-endpoint/
     └── troubleshooting.md             # Common issues and solutions
 ```
 
-# Add screenshot Architecture.png 
+# Architecture overview
 ![Architecture Overview](s3-vpc-endpoint/architecture/Architecture.png)
 
 
