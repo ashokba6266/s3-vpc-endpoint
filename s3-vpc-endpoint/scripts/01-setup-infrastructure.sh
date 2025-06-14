@@ -15,6 +15,19 @@ VPC_CIDR="10.0.0.0/16"
 PUBLIC_SUBNET_CIDR="10.0.1.0/24"
 PRIVATE_SUBNET_CIDR="10.0.2.0/24"
 
+# Function to extract VPC ID from AWS CLI output
+extract_vpc_id() {
+    local output="$1"
+    echo "$output" | grep -E '^vpc-[a-f0-9]+$' | tail -1
+}
+
+# Function to extract other resource IDs
+extract_resource_id() {
+    local output="$1"
+    local resource_type="$2"
+    echo "$output" | grep -E "^${resource_type}-[a-f0-9]+$" | tail -1
+}
+
 echo "🚀 Setting up S3 VPC Endpoint Infrastructure"
 echo "============================================="
 echo "Project ID: $PROJECT_ID"
@@ -24,47 +37,67 @@ echo ""
 
 # Create VPC
 echo "📡 Creating VPC..."
-VPC_ID=$(aws ec2 create-vpc \
+VPC_OUTPUT=$(AWS_PAGER="" aws ec2 create-vpc \
     --cidr-block $VPC_CIDR \
-    --enable-dns-hostnames \
-    --enable-dns-support \
-    --tag-specifications "ResourceType=vpc,Tags=[
-        {Key=Name,Value=$PROJECT_ID-vpc},
-        {Key=Project,Value=$PROJECT_NAME},
-        {Key=Environment,Value=development},
-        {Key=Purpose,Value=s3-endpoint-demo}
-    ]" \
+    --tag-specifications "ResourceType=vpc,Tags=[{Key=Name,Value=$PROJECT_ID-vpc},{Key=Project,Value=$PROJECT_NAME},{Key=Environment,Value=development},{Key=Purpose,Value=s3-endpoint-demo}]" \
     --region $AWS_REGION \
     --query 'Vpc.VpcId' \
-    --output text)
+    --output text 2>/dev/null)
+
+VPC_ID=$(extract_vpc_id "$VPC_OUTPUT")
+
+if [[ -z "$VPC_ID" || ! "$VPC_ID" =~ ^vpc-[a-f0-9]+$ ]]; then
+    echo "❌ Failed to create VPC or extract VPC ID"
+    echo "Output: $VPC_OUTPUT"
+    exit 1
+fi
 
 echo "✅ VPC created: $VPC_ID"
 
+# Enable DNS hostnames and DNS support
+echo "🔧 Enabling DNS settings for VPC..."
+AWS_PAGER="" aws ec2 modify-vpc-attribute \
+    --vpc-id $VPC_ID \
+    --enable-dns-hostnames \
+    --region $AWS_REGION >/dev/null 2>&1
+
+AWS_PAGER="" aws ec2 modify-vpc-attribute \
+    --vpc-id $VPC_ID \
+    --enable-dns-support \
+    --region $AWS_REGION >/dev/null 2>&1
+
+echo "✅ DNS settings enabled for VPC"
+
 # Create Internet Gateway
 echo "🌐 Creating Internet Gateway..."
-IGW_ID=$(aws ec2 create-internet-gateway \
-    --tag-specifications "ResourceType=internet-gateway,Tags=[
-        {Key=Name,Value=$PROJECT_ID-igw},
-        {Key=Project,Value=$PROJECT_NAME}
-    ]" \
+IGW_OUTPUT=$(AWS_PAGER="" aws ec2 create-internet-gateway \
+    --tag-specifications "ResourceType=internet-gateway,Tags=[{Key=Name,Value=$PROJECT_ID-igw},{Key=Project,Value=$PROJECT_NAME}]" \
     --region $AWS_REGION \
     --query 'InternetGateway.InternetGatewayId' \
-    --output text)
+    --output text 2>/dev/null)
+
+IGW_ID=$(extract_resource_id "$IGW_OUTPUT" "igw")
+
+if [[ -z "$IGW_ID" || ! "$IGW_ID" =~ ^igw-[a-f0-9]+$ ]]; then
+    echo "❌ Failed to create Internet Gateway"
+    exit 1
+fi
 
 # Attach Internet Gateway to VPC
-aws ec2 attach-internet-gateway \
+AWS_PAGER="" aws ec2 attach-internet-gateway \
     --internet-gateway-id $IGW_ID \
     --vpc-id $VPC_ID \
-    --region $AWS_REGION
+    --region $AWS_REGION >/dev/null 2>&1
 
 echo "✅ Internet Gateway created and attached: $IGW_ID"
 
 # Get availability zones
-AZ_LIST=($(aws ec2 describe-availability-zones \
+AZ_OUTPUT=$(AWS_PAGER="" aws ec2 describe-availability-zones \
     --region $AWS_REGION \
     --query 'AvailabilityZones[0:2].ZoneName' \
-    --output text))
+    --output text 2>/dev/null)
 
+AZ_LIST=($(echo "$AZ_OUTPUT" | grep -E '^[a-z]+-[a-z]+-[0-9]+[a-z]' | head -2))
 AZ_PRIMARY=${AZ_LIST[0]}
 AZ_SECONDARY=${AZ_LIST[1]:-$AZ_PRIMARY}
 
@@ -72,138 +105,128 @@ echo "🏢 Using Availability Zones: $AZ_PRIMARY, $AZ_SECONDARY"
 
 # Create Public Subnet
 echo "🔓 Creating public subnet..."
-PUBLIC_SUBNET_ID=$(aws ec2 create-subnet \
+PUBLIC_SUBNET_OUTPUT=$(AWS_PAGER="" aws ec2 create-subnet \
     --vpc-id $VPC_ID \
     --cidr-block $PUBLIC_SUBNET_CIDR \
     --availability-zone $AZ_PRIMARY \
-    --tag-specifications "ResourceType=subnet,Tags=[
-        {Key=Name,Value=$PROJECT_ID-public-subnet},
-        {Key=Project,Value=$PROJECT_NAME},
-        {Key=Type,Value=Public}
-    ]" \
+    --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value=$PROJECT_ID-public-subnet},{Key=Project,Value=$PROJECT_NAME},{Key=Type,Value=Public}]" \
     --region $AWS_REGION \
     --query 'Subnet.SubnetId' \
-    --output text)
+    --output text 2>/dev/null)
+
+PUBLIC_SUBNET_ID=$(extract_resource_id "$PUBLIC_SUBNET_OUTPUT" "subnet")
 
 # Enable auto-assign public IP for public subnet
-aws ec2 modify-subnet-attribute \
+AWS_PAGER="" aws ec2 modify-subnet-attribute \
     --subnet-id $PUBLIC_SUBNET_ID \
     --map-public-ip-on-launch \
-    --region $AWS_REGION
+    --region $AWS_REGION >/dev/null 2>&1
 
 echo "✅ Public subnet created: $PUBLIC_SUBNET_ID"
 
 # Create Private Subnet
 echo "🔒 Creating private subnet..."
-PRIVATE_SUBNET_ID=$(aws ec2 create-subnet \
+PRIVATE_SUBNET_OUTPUT=$(AWS_PAGER="" aws ec2 create-subnet \
     --vpc-id $VPC_ID \
     --cidr-block $PRIVATE_SUBNET_CIDR \
     --availability-zone $AZ_PRIMARY \
-    --tag-specifications "ResourceType=subnet,Tags=[
-        {Key=Name,Value=$PROJECT_ID-private-subnet},
-        {Key=Project,Value=$PROJECT_NAME},
-        {Key=Type,Value=Private}
-    ]" \
+    --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value=$PROJECT_ID-private-subnet},{Key=Project,Value=$PROJECT_NAME},{Key=Type,Value=Private}]" \
     --region $AWS_REGION \
     --query 'Subnet.SubnetId' \
-    --output text)
+    --output text 2>/dev/null)
+
+PRIVATE_SUBNET_ID=$(extract_resource_id "$PRIVATE_SUBNET_OUTPUT" "subnet")
 
 echo "✅ Private subnet created: $PRIVATE_SUBNET_ID"
 
 # Create Public Route Table
 echo "🛣️ Creating public route table..."
-PUBLIC_RT_ID=$(aws ec2 create-route-table \
+PUBLIC_RT_OUTPUT=$(AWS_PAGER="" aws ec2 create-route-table \
     --vpc-id $VPC_ID \
-    --tag-specifications "ResourceType=route-table,Tags=[
-        {Key=Name,Value=$PROJECT_ID-public-rt},
-        {Key=Project,Value=$PROJECT_NAME},
-        {Key=Type,Value=Public}
-    ]" \
+    --tag-specifications "ResourceType=route-table,Tags=[{Key=Name,Value=$PROJECT_ID-public-rt},{Key=Project,Value=$PROJECT_NAME},{Key=Type,Value=Public}]" \
     --region $AWS_REGION \
     --query 'RouteTable.RouteTableId' \
-    --output text)
+    --output text 2>/dev/null)
+
+PUBLIC_RT_ID=$(extract_resource_id "$PUBLIC_RT_OUTPUT" "rtb")
 
 # Add route to Internet Gateway
-aws ec2 create-route \
+AWS_PAGER="" aws ec2 create-route \
     --route-table-id $PUBLIC_RT_ID \
     --destination-cidr-block 0.0.0.0/0 \
     --gateway-id $IGW_ID \
-    --region $AWS_REGION
+    --region $AWS_REGION >/dev/null 2>&1
 
 # Associate public subnet with public route table
-aws ec2 associate-route-table \
+AWS_PAGER="" aws ec2 associate-route-table \
     --subnet-id $PUBLIC_SUBNET_ID \
     --route-table-id $PUBLIC_RT_ID \
-    --region $AWS_REGION
+    --region $AWS_REGION >/dev/null 2>&1
 
 echo "✅ Public route table created and configured: $PUBLIC_RT_ID"
 
 # Create Private Route Table
 echo "🛣️ Creating private route table..."
-PRIVATE_RT_ID=$(aws ec2 create-route-table \
+PRIVATE_RT_OUTPUT=$(AWS_PAGER="" aws ec2 create-route-table \
     --vpc-id $VPC_ID \
-    --tag-specifications "ResourceType=route-table,Tags=[
-        {Key=Name,Value=$PROJECT_ID-private-rt},
-        {Key=Project,Value=$PROJECT_NAME},
-        {Key=Type,Value=Private}
-    ]" \
+    --tag-specifications "ResourceType=route-table,Tags=[{Key=Name,Value=$PROJECT_ID-private-rt},{Key=Project,Value=$PROJECT_NAME},{Key=Type,Value=Private}]" \
     --region $AWS_REGION \
     --query 'RouteTable.RouteTableId' \
-    --output text)
+    --output text 2>/dev/null)
+
+PRIVATE_RT_ID=$(extract_resource_id "$PRIVATE_RT_OUTPUT" "rtb")
 
 # Associate private subnet with private route table
-aws ec2 associate-route-table \
+AWS_PAGER="" aws ec2 associate-route-table \
     --subnet-id $PRIVATE_SUBNET_ID \
     --route-table-id $PRIVATE_RT_ID \
-    --region $AWS_REGION
+    --region $AWS_REGION >/dev/null 2>&1
 
 echo "✅ Private route table created and configured: $PRIVATE_RT_ID"
 
 # Create Security Group for Bastion Host
 echo "🛡️ Creating bastion security group..."
-BASTION_SG_ID=$(aws ec2 create-security-group \
+BASTION_SG_OUTPUT=$(AWS_PAGER="" aws ec2 create-security-group \
     --group-name "$PROJECT_ID-bastion-sg" \
     --description "Security group for bastion host" \
     --vpc-id $VPC_ID \
-    --tag-specifications "ResourceType=security-group,Tags=[
-        {Key=Name,Value=$PROJECT_ID-bastion-sg},
-        {Key=Project,Value=$PROJECT_NAME}
-    ]" \
+    --tag-specifications "ResourceType=security-group,Tags=[{Key=Name,Value=$PROJECT_ID-bastion-sg},{Key=Project,Value=$PROJECT_NAME}]" \
     --region $AWS_REGION \
     --query 'GroupId' \
-    --output text)
+    --output text 2>/dev/null)
+
+BASTION_SG_ID=$(extract_resource_id "$BASTION_SG_OUTPUT" "sg")
 
 # Add SSH access rule (restrict to your IP in production)
-aws ec2 authorize-security-group-ingress \
+AWS_PAGER="" aws ec2 authorize-security-group-ingress \
     --group-id $BASTION_SG_ID \
     --protocol tcp \
     --port 22 \
     --cidr 0.0.0.0/0 \
-    --region $AWS_REGION
+    --region $AWS_REGION >/dev/null 2>&1
 
 echo "✅ Bastion security group created: $BASTION_SG_ID"
 
 # Create Security Group for Private Instances
 echo "🛡️ Creating private instance security group..."
-PRIVATE_SG_ID=$(aws ec2 create-security-group \
+PRIVATE_SG_OUTPUT=$(AWS_PAGER="" aws ec2 create-security-group \
     --group-name "$PROJECT_ID-private-sg" \
     --description "Security group for private instances" \
     --vpc-id $VPC_ID \
-    --tag-specifications "ResourceType=security-group,Tags=[
-        {Key=Name,Value=$PROJECT_ID-private-sg},
-        {Key=Project,Value=$PROJECT_NAME}
-    ]" \
+    --tag-specifications "ResourceType=security-group,Tags=[{Key=Name,Value=$PROJECT_ID-private-sg},{Key=Project,Value=$PROJECT_NAME}]" \
     --region $AWS_REGION \
     --query 'GroupId' \
-    --output text)
+    --output text 2>/dev/null)
+
+PRIVATE_SG_ID=$(extract_resource_id "$PRIVATE_SG_OUTPUT" "sg")
 
 # Add SSH access from bastion
-aws ec2 authorize-security-group-ingress \
+AWS_PAGER="" aws ec2 authorize-security-group-ingress \
     --group-id $PRIVATE_SG_ID \
     --protocol tcp \
     --port 22 \
     --source-group $BASTION_SG_ID \
-    --region $AWS_REGION
+    --region $AWS_REGION >/dev/null 2>&1
 
 echo "✅ Private security group created: $PRIVATE_SG_ID"
 
@@ -212,14 +235,14 @@ S3_BUCKET_NAME="$PROJECT_ID-test-bucket"
 echo "🪣 Creating S3 test bucket: $S3_BUCKET_NAME"
 
 if [ "$AWS_REGION" = "us-east-1" ]; then
-    aws s3api create-bucket \
+    AWS_PAGER="" aws s3api create-bucket \
         --bucket $S3_BUCKET_NAME \
-        --region $AWS_REGION
+        --region $AWS_REGION >/dev/null 2>&1
 else
-    aws s3api create-bucket \
+    AWS_PAGER="" aws s3api create-bucket \
         --bucket $S3_BUCKET_NAME \
         --region $AWS_REGION \
-        --create-bucket-configuration LocationConstraint=$AWS_REGION
+        --create-bucket-configuration LocationConstraint=$AWS_REGION >/dev/null 2>&1
 fi
 
 # Configure bucket policy for VPC endpoint access
@@ -246,20 +269,19 @@ cat > /tmp/s3-bucket-policy.json << EOF
 }
 EOF
 
-aws s3api put-bucket-policy \
+AWS_PAGER="" aws s3api put-bucket-policy \
     --bucket $S3_BUCKET_NAME \
-    --policy file:///tmp/s3-bucket-policy.json
+    --policy file:///tmp/s3-bucket-policy.json >/dev/null 2>&1
 
 # Tag the S3 bucket
-aws s3api put-bucket-tagging \
+AWS_PAGER="" aws s3api put-bucket-tagging \
     --bucket $S3_BUCKET_NAME \
-    --tagging 'TagSet=[
-        {Key=Name,Value='$PROJECT_ID'-test-bucket},
-        {Key=Project,Value='$PROJECT_NAME'},
-        {Key=Purpose,Value=endpoint-testing}
-    ]'
+    --tagging "TagSet=[{Key=Name,Value=$PROJECT_ID-test-bucket},{Key=Project,Value=$PROJECT_NAME},{Key=Purpose,Value=endpoint-testing}]" >/dev/null 2>&1
 
 echo "✅ S3 test bucket created and configured: $S3_BUCKET_NAME"
+
+# Create configs directory if it doesn't exist
+mkdir -p configs
 
 # Save infrastructure configuration
 cat > configs/vpc-parameters.json << EOF

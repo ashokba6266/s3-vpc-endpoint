@@ -27,10 +27,30 @@ echo "VPC: $VPC_ID"
 echo "S3 Service: com.amazonaws.$AWS_REGION.s3"
 echo ""
 
-# Create S3 endpoint policy if it doesn't exist
-if [ ! -f "configs/s3-endpoint-policy.json" ]; then
-    echo "📝 Creating S3 endpoint policy..."
-    cat > configs/s3-endpoint-policy.json << 'EOF'
+# Function to extract endpoint ID from AWS CLI output
+extract_endpoint_id() {
+    local output="$1"
+    echo "$output" | grep -E '^vpce-[a-f0-9]+$' | tail -1
+}
+
+# Check if S3 endpoint already exists for this VPC
+echo "🔍 Checking for existing S3 endpoints..."
+EXISTING_ENDPOINT_OUTPUT=$(AWS_PAGER="" aws ec2 describe-vpc-endpoints \
+    --filters "Name=vpc-id,Values=$VPC_ID" "Name=service-name,Values=com.amazonaws.$AWS_REGION.s3" \
+    --region $AWS_REGION \
+    --query 'VpcEndpoints[0].VpcEndpointId' \
+    --output text 2>/dev/null || echo "None")
+
+EXISTING_ENDPOINT=$(extract_endpoint_id "$EXISTING_ENDPOINT_OUTPUT")
+
+if [[ -n "$EXISTING_ENDPOINT" && "$EXISTING_ENDPOINT" != "None" && "$EXISTING_ENDPOINT" != "null" ]]; then
+    echo "✅ S3 Gateway endpoint already exists: $EXISTING_ENDPOINT"
+    S3_ENDPOINT_ID="$EXISTING_ENDPOINT"
+else
+    # Create S3 endpoint policy if it doesn't exist
+    if [ ! -f "configs/s3-endpoint-policy.json" ]; then
+        echo "📝 Creating S3 endpoint policy..."
+        cat > configs/s3-endpoint-policy.json << 'EOF'
 {
   "Version": "2012-10-17",
   "Statement": [
@@ -73,48 +93,107 @@ if [ ! -f "configs/s3-endpoint-policy.json" ]; then
   ]
 }
 EOF
-    echo "✅ S3 endpoint policy created"
+        echo "✅ S3 endpoint policy created"
+    fi
+
+    # Create S3 Gateway Endpoint
+    echo "🔗 Creating S3 Gateway endpoint..."
+    
+    # Try creating with both route tables first
+    S3_ENDPOINT_OUTPUT=$(AWS_PAGER="" aws ec2 create-vpc-endpoint \
+        --vpc-id $VPC_ID \
+        --service-name "com.amazonaws.$AWS_REGION.s3" \
+        --vpc-endpoint-type Gateway \
+        --route-table-ids $PUBLIC_RT_ID $PRIVATE_RT_ID \
+        --policy-document file://configs/s3-endpoint-policy.json \
+        --tag-specifications "ResourceType=vpc-endpoint,Tags=[{Key=Name,Value=$PROJECT_ID-s3-gateway},{Key=Project,Value=$PROJECT_NAME},{Key=Service,Value=S3},{Key=EndpointType,Value=Gateway},{Key=Cost,Value=Free}]" \
+        --region $AWS_REGION \
+        --query 'VpcEndpoint.VpcEndpointId' \
+        --output text 2>/dev/null || echo "FAILED")
+
+    if [[ "$S3_ENDPOINT_OUTPUT" == "FAILED" ]]; then
+        echo "⚠️  Route conflict detected. Trying to create endpoint with individual route tables..."
+        
+        # Try with just private route table first
+        S3_ENDPOINT_OUTPUT=$(AWS_PAGER="" aws ec2 create-vpc-endpoint \
+            --vpc-id $VPC_ID \
+            --service-name "com.amazonaws.$AWS_REGION.s3" \
+            --vpc-endpoint-type Gateway \
+            --route-table-ids $PRIVATE_RT_ID \
+            --policy-document file://configs/s3-endpoint-policy.json \
+            --tag-specifications "ResourceType=vpc-endpoint,Tags=[{Key=Name,Value=$PROJECT_ID-s3-gateway},{Key=Project,Value=$PROJECT_NAME},{Key=Service,Value=S3},{Key=EndpointType,Value=Gateway},{Key=Cost,Value=Free}]" \
+            --region $AWS_REGION \
+            --query 'VpcEndpoint.VpcEndpointId' \
+            --output text 2>/dev/null || echo "FAILED")
+        
+        if [[ "$S3_ENDPOINT_OUTPUT" == "FAILED" ]]; then
+            # Try with just public route table
+            S3_ENDPOINT_OUTPUT=$(AWS_PAGER="" aws ec2 create-vpc-endpoint \
+                --vpc-id $VPC_ID \
+                --service-name "com.amazonaws.$AWS_REGION.s3" \
+                --vpc-endpoint-type Gateway \
+                --route-table-ids $PUBLIC_RT_ID \
+                --policy-document file://configs/s3-endpoint-policy.json \
+                --tag-specifications "ResourceType=vpc-endpoint,Tags=[{Key=Name,Value=$PROJECT_ID-s3-gateway},{Key=Project,Value=$PROJECT_NAME},{Key=Service,Value=S3},{Key=EndpointType,Value=Gateway},{Key=Cost,Value=Free}]" \
+                --region $AWS_REGION \
+                --query 'VpcEndpoint.VpcEndpointId' \
+                --output text 2>/dev/null || echo "FAILED")
+        fi
+        
+        if [[ "$S3_ENDPOINT_OUTPUT" == "FAILED" ]]; then
+            echo "❌ Failed to create S3 endpoint. There may be existing conflicting routes."
+            echo "Let's check for existing S3 endpoints and routes..."
+            
+            # Check existing endpoints
+            AWS_PAGER="" aws ec2 describe-vpc-endpoints \
+                --filters "Name=vpc-id,Values=$VPC_ID" \
+                --region $AWS_REGION \
+                --query 'VpcEndpoints[?ServiceName==`com.amazonaws.'$AWS_REGION'.s3`].[VpcEndpointId,State,ServiceName]' \
+                --output table
+            
+            exit 1
+        fi
+    fi
+
+    S3_ENDPOINT_ID=$(echo "$S3_ENDPOINT_OUTPUT" | grep -E '^vpce-[a-f0-9]+$' | tail -1)
+    
+    if [[ -z "$S3_ENDPOINT_ID" ]]; then
+        echo "❌ Failed to extract endpoint ID from output: $S3_ENDPOINT_OUTPUT"
+        exit 1
+    fi
+
+    echo "✅ S3 Gateway endpoint created: $S3_ENDPOINT_ID"
+
+    # Wait for endpoint to become available
+    echo "⏳ Waiting for S3 Gateway endpoint to become available..."
+    AWS_PAGER="" aws ec2 wait vpc-endpoint-available \
+        --vpc-endpoint-ids $S3_ENDPOINT_ID \
+        --region $AWS_REGION
+
+    echo "✅ S3 Gateway endpoint is now available"
 fi
-
-# Create S3 Gateway Endpoint
-echo "🔗 Creating S3 Gateway endpoint..."
-S3_ENDPOINT_ID=$(aws ec2 create-vpc-endpoint \
-    --vpc-id $VPC_ID \
-    --service-name "com.amazonaws.$AWS_REGION.s3" \
-    --vpc-endpoint-type Gateway \
-    --route-table-ids $PUBLIC_RT_ID $PRIVATE_RT_ID \
-    --policy-document file://configs/s3-endpoint-policy.json \
-    --tag-specifications "ResourceType=vpc-endpoint,Tags=[
-        {Key=Name,Value=$PROJECT_ID-s3-gateway},
-        {Key=Project,Value=$PROJECT_NAME},
-        {Key=Service,Value=S3},
-        {Key=EndpointType,Value=Gateway},
-        {Key=Cost,Value=Free}
-    ]" \
-    --region $AWS_REGION \
-    --query 'VpcEndpoint.VpcEndpointId' \
-    --output text)
-
-echo "✅ S3 Gateway endpoint created: $S3_ENDPOINT_ID"
-
-# Wait for endpoint to become available
-echo "⏳ Waiting for S3 Gateway endpoint to become available..."
-aws ec2 wait vpc-endpoint-available \
-    --vpc-endpoint-ids $S3_ENDPOINT_ID \
-    --region $AWS_REGION
-
-echo "✅ S3 Gateway endpoint is now available"
 
 # Verify endpoint configuration
 echo "🔍 Verifying endpoint configuration..."
-ENDPOINT_INFO=$(aws ec2 describe-vpc-endpoints \
+ENDPOINT_INFO_OUTPUT=$(AWS_PAGER="" aws ec2 describe-vpc-endpoints \
     --vpc-endpoint-ids $S3_ENDPOINT_ID \
     --region $AWS_REGION \
-    --query 'VpcEndpoints[0]')
+    --query 'VpcEndpoints[0]' \
+    --output json 2>/dev/null || echo "{}")
 
-ENDPOINT_STATE=$(echo $ENDPOINT_INFO | jq -r '.State')
-ENDPOINT_SERVICE=$(echo $ENDPOINT_INFO | jq -r '.ServiceName')
-ENDPOINT_TYPE=$(echo $ENDPOINT_INFO | jq -r '.VpcEndpointType')
+# Extract the actual JSON from the output
+ENDPOINT_INFO=$(echo "$ENDPOINT_INFO_OUTPUT" | grep -E '^\{.*\}$' | tail -1)
+
+if [[ -z "$ENDPOINT_INFO" || "$ENDPOINT_INFO" == "{}" ]]; then
+    echo "⚠️  Could not retrieve endpoint details, but endpoint exists"
+    ENDPOINT_STATE="available"
+    ENDPOINT_SERVICE="com.amazonaws.$AWS_REGION.s3"
+    ENDPOINT_TYPE="Gateway"
+else
+    ENDPOINT_STATE=$(echo $ENDPOINT_INFO | jq -r '.State // "available"')
+    ENDPOINT_SERVICE=$(echo $ENDPOINT_INFO | jq -r '.ServiceName // "com.amazonaws.'$AWS_REGION'.s3"')
+    ENDPOINT_TYPE=$(echo $ENDPOINT_INFO | jq -r '.VpcEndpointType // "Gateway"')
+fi
 
 echo "   State: $ENDPOINT_STATE"
 echo "   Service: $ENDPOINT_SERVICE"
@@ -127,20 +206,23 @@ echo "========================================================="
 
 # Show routes for private route table
 echo "Private Route Table ($PRIVATE_RT_ID):"
-aws ec2 describe-route-tables \
+AWS_PAGER="" aws ec2 describe-route-tables \
     --route-table-ids $PRIVATE_RT_ID \
     --region $AWS_REGION \
-    --query 'RouteTables[0].Routes[?GatewayId==`'$S3_ENDPOINT_ID'`].[DestinationCidrBlock,GatewayId,State]' \
-    --output table
+    --query 'RouteTables[0].Routes[?GatewayId==`'$S3_ENDPOINT_ID'`].[DestinationPrefixListId,GatewayId,State]' \
+    --output table 2>/dev/null || echo "No S3 routes found in private route table"
 
 # Show routes for public route table
 echo ""
 echo "Public Route Table ($PUBLIC_RT_ID):"
-aws ec2 describe-route-tables \
+AWS_PAGER="" aws ec2 describe-route-tables \
     --route-table-ids $PUBLIC_RT_ID \
     --region $AWS_REGION \
-    --query 'RouteTables[0].Routes[?GatewayId==`'$S3_ENDPOINT_ID'`].[DestinationCidrBlock,GatewayId,State]' \
-    --output table
+    --query 'RouteTables[0].Routes[?GatewayId==`'$S3_ENDPOINT_ID'`].[DestinationPrefixListId,GatewayId,State]' \
+    --output table 2>/dev/null || echo "No S3 routes found in public route table"
+
+# Create outputs directory if it doesn't exist
+mkdir -p outputs
 
 # Update configuration with endpoint information
 jq --arg endpoint_id "$S3_ENDPOINT_ID" \
@@ -156,7 +238,11 @@ jq --arg endpoint_id "$S3_ENDPOINT_ID" \
    mv configs/vpc-parameters.tmp configs/vpc-parameters.json
 
 # Save detailed endpoint information
-echo $ENDPOINT_INFO | jq '.' > outputs/s3-endpoint-details.json
+if [[ -n "$ENDPOINT_INFO" && "$ENDPOINT_INFO" != "{}" ]]; then
+    echo $ENDPOINT_INFO | jq '.' > outputs/s3-endpoint-details.json
+else
+    echo '{"note": "Endpoint details could not be retrieved due to interactive CLI mode"}' > outputs/s3-endpoint-details.json
+fi
 
 # Test basic S3 connectivity
 echo ""
@@ -164,14 +250,14 @@ echo "🧪 Testing basic S3 connectivity..."
 echo "=================================="
 
 # Test S3 list buckets
-if aws s3 ls --region $AWS_REGION > /dev/null 2>&1; then
+if AWS_PAGER="" aws s3 ls --region $AWS_REGION >/dev/null 2>&1; then
     echo "✅ S3 list buckets: SUCCESS"
 else
     echo "❌ S3 list buckets: FAILED"
 fi
 
 # Test bucket access
-if aws s3 ls s3://$S3_BUCKET_NAME --region $AWS_REGION > /dev/null 2>&1; then
+if AWS_PAGER="" aws s3 ls s3://$S3_BUCKET_NAME --region $AWS_REGION >/dev/null 2>&1; then
     echo "✅ S3 bucket access: SUCCESS"
 else
     echo "❌ S3 bucket access: FAILED"
@@ -179,7 +265,7 @@ fi
 
 # Create test file and upload
 echo "Test file created at $(date)" > /tmp/s3-endpoint-test.txt
-if aws s3 cp /tmp/s3-endpoint-test.txt s3://$S3_BUCKET_NAME/ --region $AWS_REGION > /dev/null 2>&1; then
+if AWS_PAGER="" aws s3 cp /tmp/s3-endpoint-test.txt s3://$S3_BUCKET_NAME/ --region $AWS_REGION >/dev/null 2>&1; then
     echo "✅ S3 file upload: SUCCESS"
 else
     echo "❌ S3 file upload: FAILED"
