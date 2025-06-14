@@ -51,7 +51,7 @@ s3-vpc-endpoint/
 ```
 
 # Add screenshot Architecture.png 
-![Architecture Overview](architecture/Architecture.png)
+![Architecture Overview](s3-vpc-endpoint/architecture/Architecture.png)
 
 
 ## 🚀 Quick Start Guide
